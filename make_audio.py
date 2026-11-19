@@ -142,42 +142,52 @@ def chunks(paragraphs):
 
 
 def find_voice(client):
+    """The voice to speak with: VOICE_ID when set, otherwise the voice named VOICE_NAME."""
     if VOICE_ID:
         return VOICE_ID
-    seen = []
-    for v in client.voices.list(page_size=100):
-        name = (getattr(v, "display_name", "") or "").strip()
-        vid = getattr(v, "id", "") or ""
-        seen.append("%s (%s)" % (name, vid))
-        if name.lower() == VOICE_NAME.lower() or vid == VOICE_NAME:
-            return vid
-    sys.exit("Could not find a voice named %r in this Google account.\nVoices found: %s\n"
-             "Copy the id (voice_...) of the voice from AI Studio and save it as the VOICE_ID secret/variable."
-             % (VOICE_NAME, ", ".join(seen[:40]) or "none"))
+    try:
+        resp = client.voices.list(type_=["prompted", "replicated"])
+        seen = []
+        for v in (getattr(resp, "voices", None) or []):
+            name = (getattr(v, "display_name", "") or "").strip()
+            vid = getattr(v, "id", "") or ""
+            seen.append("%s (%s)" % (name, vid))
+            if name.lower() == VOICE_NAME.lower() or vid == VOICE_NAME:
+                print("Using the voice %r (%s)" % (name, vid))
+                return vid
+        print("No voice called %r. Voices on this key: %s" % (VOICE_NAME, ", ".join(seen[:40]) or "none"))
+    except Exception as err:
+        print("Could not list the voices (%s)" % str(err)[:200])
+    print("Using %r as the voice itself." % VOICE_NAME)
+    return VOICE_NAME
 
 
 def synthesize(client, voice, text):
     """One piece of text -> raw 16-bit mono PCM at 24 kHz. Tries again if Google is busy."""
-    part = {"text": text}
+    content = {"type": "text", "text": text}
     if STYLE:
-        part["speech_metadata"] = {"style": STYLE}
+        content["annotations"] = [{"type": "speech_metadata", "style": STYLE}]
     for attempt in range(5):
         try:
-            resp = client.models.generate_content(
+            interaction = client.interactions.create(
                 model=MODEL,
-                contents=[{"role": "user", "parts": [part]}],
-                config={"response_modalities": ["AUDIO"], "speech_config": {"voice_config": {"voice": voice}}},
+                input=[{"type": "user_input", "content": [content]}],
+                response_format={"type": "audio"},
+                generation_config={"speech_config": [{"voice": voice}]},
             )
-            data = resp.candidates[0].content.parts[0].inline_data.data
+            data = interaction.output_audio.data
             if isinstance(data, str):
                 data = base64.b64decode(data)
             if data[:4] == b"RIFF":                      # a complete WAV: take the samples out of it
                 with wave.open(io.BytesIO(data)) as w:
                     return w.readframes(w.getnframes())
             return data                                  # already raw samples
-        except Exception as err:                         # busy, rate limit, a hiccup: wait and try again
+        except Exception as err:
+            msg = str(err)
+            if "INVALID_ARGUMENT" in msg or "400" in msg[:40] or "NOT_FOUND" in msg or "PERMISSION_DENIED" in msg:
+                raise RuntimeError("Google refused the request: %s" % msg[:400])   # asking again will not help
             wait = 8 * (2 ** attempt)
-            print("   attempt %d failed (%s); waiting %ds" % (attempt + 1, str(err)[:160], wait))
+            print("   attempt %d failed (%s); waiting %ds" % (attempt + 1, msg[:160], wait))
             time.sleep(wait)
     raise RuntimeError("Google's text-to-speech kept failing")
 
