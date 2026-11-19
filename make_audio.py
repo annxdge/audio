@@ -16,7 +16,7 @@ Settings (environment variables, all optional except the key):
   GEMINI_API_KEY   the key from Google AI Studio (set it as a GitHub secret)
   VOICE_NAME       the name of the voice in AI Studio              default: Fola
   VOICE_ID         the voice's id (voice_...), if the name is not found
-  TTS_MODEL        the text-to-speech model                        default: gemini-3.8-flash-tts
+  TTS_MODEL        the text-to-speech model(s), separated by commas; the first that works is used
   TTS_STYLE        a style note, e.g. "calm, warm, unhurried"      default: none
   BLOG_FEED        the blog feed                                   default: https://www.anadegenaar.com/feeds/posts/default
   LOOKBACK         how many of the newest posts to check            default: 25   (0 = all)
@@ -31,7 +31,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FEED = os.environ.get("BLOG_FEED", "https://www.anadegenaar.com/feeds/posts/default")
 VOICE_NAME = os.environ.get("VOICE_NAME", "Fola")
 VOICE_ID = os.environ.get("VOICE_ID", "").strip()
-MODEL = os.environ.get("TTS_MODEL", "gemini-3.8-flash-tts")
+MODELS = [m.strip() for m in os.environ.get("TTS_MODEL",
+          "gemini-3.8-flash-tts,gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts").split(",") if m.strip()]
 STYLE = os.environ.get("TTS_STYLE", "").strip()
 LOOKBACK = int(os.environ.get("LOOKBACK", "25"))
 MAX_NEW = int(os.environ.get("MAX_NEW", "4"))
@@ -162,34 +163,49 @@ def find_voice(client):
     return VOICE_NAME
 
 
+_chosen = {"i": 0}            # which model in MODELS is working
+
+
 def synthesize(client, voice, text):
-    """One piece of text -> raw 16-bit mono PCM at 24 kHz. Tries again if Google is busy."""
+    """One piece of text -> raw 16-bit mono PCM at 24 kHz. Tries another model if one is unavailable."""
     content = {"type": "text", "text": text}
     if STYLE:
         content["annotations"] = [{"type": "speech_metadata", "style": STYLE}]
-    for attempt in range(5):
-        try:
-            interaction = client.interactions.create(
-                model=MODEL,
-                input=[{"type": "user_input", "content": [content]}],
-                response_format={"type": "audio"},
-                generation_config={"speech_config": [{"voice": voice}]},
-            )
-            data = interaction.output_audio.data
-            if isinstance(data, str):
-                data = base64.b64decode(data)
-            if data[:4] == b"RIFF":                      # a complete WAV: take the samples out of it
-                with wave.open(io.BytesIO(data)) as w:
-                    return w.readframes(w.getnframes())
-            return data                                  # already raw samples
-        except Exception as err:
-            msg = str(err)
-            if "INVALID_ARGUMENT" in msg or "400" in msg[:40] or "NOT_FOUND" in msg or "PERMISSION_DENIED" in msg:
-                raise RuntimeError("Google refused the request: %s" % msg[:400])   # asking again will not help
-            wait = 8 * (2 ** attempt)
-            print("   attempt %d failed (%s); waiting %ds" % (attempt + 1, msg[:160], wait))
-            time.sleep(wait)
-    raise RuntimeError("Google's text-to-speech kept failing")
+    last = ""
+    while _chosen["i"] < len(MODELS):
+        model, moved = MODELS[_chosen["i"]], False
+        for attempt in range(4):
+            try:
+                interaction = client.interactions.create(
+                    model=model,
+                    input=[{"type": "user_input", "content": [content]}],
+                    response_format={"type": "audio"},
+                    generation_config={"speech_config": [{"voice": voice}]},
+                )
+                data = interaction.output_audio.data
+                if isinstance(data, str):
+                    data = base64.b64decode(data)
+                if data[:4] == b"RIFF":                  # a complete WAV: take the samples out of it
+                    with wave.open(io.BytesIO(data)) as w:
+                        return w.readframes(w.getnframes())
+                return data                              # already raw samples
+            except Exception as err:
+                last = str(err)
+                low = last.lower()
+                if "not found" in low or "404" in low[:80]:
+                    print("   %s is not available on this key; trying the next model" % model)
+                    moved = True
+                    break
+                if ("invalid_argument" in low or "permission" in low or "unauthorized" in low
+                        or "api key" in low or "400" in low[:80]):
+                    raise RuntimeError("Google refused the request: %s" % last[:400])
+                wait = 8 * (2 ** attempt)
+                print("   attempt %d failed (%s); waiting %ds" % (attempt + 1, last[:160], wait))
+                time.sleep(wait)
+        if not moved:
+            raise RuntimeError("Google's text-to-speech kept failing: %s" % last[:300])
+        _chosen["i"] += 1
+    raise RuntimeError("None of these models worked (%s). Last answer: %s" % (", ".join(MODELS), last[:300]))
 
 
 def to_mp3(pcm, path):
@@ -242,7 +258,7 @@ def main():
     if not key:
         sys.exit("GEMINI_API_KEY is not set.")
     from google import genai
-    client = genai.Client(api_key=key)
+    client = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
     voice = find_voice(client)
     made = 0
     for item in todo[:MAX_NEW]:
